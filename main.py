@@ -1,6 +1,7 @@
 import asyncio
 import os
 import uuid
+import json
 from datetime import datetime, timedelta
 from typing import AsyncGenerator
 
@@ -11,7 +12,6 @@ from supabase import create_client, Client
 
 app = FastAPI()
 
-# ── CORS（rikkahub 是 web app 时必须）─────────────────────
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,7 +25,7 @@ supabase: Client = create_client(
     os.environ["SUPABASE_KEY"]
 )
 
-# ── Session 管理（每个 SSE 连接一个 session）──────────────
+# ── SSE Session 管理 ───────────────────────────────────────
 sessions: dict[str, asyncio.Queue] = {}
 
 # ── MCP 工具定义 ──────────────────────────────────────────
@@ -86,7 +86,7 @@ async def get_health_data(days: int = 3) -> str:
 
 
 # ── MCP 消息处理 ───────────────────────────────────────────
-async def handle_message(body: dict) -> dict:
+async def handle_message(body: dict) -> dict | None:
     method = body.get("method")
     msg_id = body.get("id")
 
@@ -100,8 +100,8 @@ async def handle_message(body: dict) -> dict:
             }
         }
 
-    if method == "notifications/initialized":
-        return None  # 通知类不需要响应
+    if method in ("notifications/initialized", "initialized"):
+        return None
 
     if method == "tools/list":
         return {
@@ -136,26 +136,59 @@ async def handle_message(body: dict) -> dict:
     return None
 
 
-# ── SSE 端点 ───────────────────────────────────────────────
+# ── Streamable HTTP 端点（新协议，rikkahub 用这个）─────────
+@app.post("/mcp")
+@app.post("/messages")
+async def streamable_http(request: Request):
+    """Streamable HTTP transport - 直接 POST，直接返回结果"""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(
+            {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}},
+            status_code=400
+        )
+
+    # 支持批量请求
+    if isinstance(body, list):
+        results = []
+        for item in body:
+            r = await handle_message(item)
+            if r is not None:
+                results.append(r)
+        return JSONResponse(results)
+
+    response = await handle_message(body)
+    if response is None:
+        return Response(status_code=202)
+
+    # 检查客户端是否接受 SSE 流式响应
+    accept = request.headers.get("accept", "")
+    if "text/event-stream" in accept:
+        async def stream():
+            yield f"event: message\ndata: {json.dumps(response)}\n\n"
+        return StreamingResponse(stream(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    return JSONResponse(response)
+
+
+# ── SSE 端点（旧协议备用）────────────────────────────────
 @app.get("/sse")
 async def sse_endpoint(request: Request):
     session_id = str(uuid.uuid4())
     queue: asyncio.Queue = asyncio.Queue()
     sessions[session_id] = queue
-
     base_url = str(request.base_url).rstrip("/")
 
     async def event_stream() -> AsyncGenerator[str, None]:
-        # 告知客户端 POST 地址（含 sessionId）
         yield f"event: endpoint\ndata: {base_url}/messages?sessionId={session_id}\n\n"
-
         try:
             while True:
                 if await request.is_disconnected():
                     break
                 try:
                     message = await asyncio.wait_for(queue.get(), timeout=15)
-                    import json
                     yield f"event: message\ndata: {json.dumps(message)}\n\n"
                 except asyncio.TimeoutError:
                     yield ": ping\n\n"
@@ -165,32 +198,21 @@ async def sse_endpoint(request: Request):
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-            "Connection": "keep-alive",
-        }
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"}
     )
 
-
-# ── POST 消息端点 ──────────────────────────────────────────
 @app.post("/messages")
-async def messages_endpoint(request: Request):
+async def sse_messages(request: Request):
     session_id = request.query_params.get("sessionId")
-
     body = await request.json()
     response = await handle_message(body)
-
     if session_id and session_id in sessions:
-        # 把结果推入对应 SSE 队列
         if response is not None:
             await sessions[session_id].put(response)
         return Response(status_code=202)
-    else:
-        # 无 session 降级为直接返回（兼容模式）
-        if response is not None:
-            return JSONResponse(response)
-        return Response(status_code=202)
+    if response is not None:
+        return JSONResponse(response)
+    return Response(status_code=202)
 
 
 # ── 健康检查 ───────────────────────────────────────────────
