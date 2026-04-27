@@ -1,4 +1,5 @@
-fastapi
-uvicorn[standard]
+mcp[cli]
 supabase
+uvicorn[standard]
+starlette
 httpx
