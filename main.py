@@ -1,7 +1,7 @@
 import os
 import asyncio
 import uvicorn
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.sse import SseServerTransport
@@ -17,6 +17,16 @@ supabase: Client = create_client(
     os.environ["SUPABASE_KEY"]
 )
 
+RETAIN_DAYS = 2
+
+# ── 自动清理：每次查询前删除超过 RETAIN_DAYS 天的数据 ──
+def _cleanup():
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=RETAIN_DAYS)).isoformat()
+        supabase.table("health_data").lt("recorded_at", cutoff).delete().execute()
+    except:
+        pass
+
 # ── FastMCP ────────────────────────────────────────────────
 mcp = FastMCP("HealthNode")
 
@@ -27,6 +37,8 @@ async def get_health_data(days: int = 3) -> str:
     可指定查询最近几天，默认 3 天。
     """
     try:
+        await asyncio.to_thread(_cleanup)
+
         now_bj = datetime.utcnow() + timedelta(hours=8)
         since = (now_bj - timedelta(days=days)).isoformat()
 
@@ -44,7 +56,19 @@ async def get_health_data(days: int = 3) -> str:
         if not res or not res.data:
             return f"📊 近{days}天暂无健康数据记录。"
 
-        lines = [f"📊 【近{days}天健康数据】:"]
+        # 统计心率/血氧
+        hr_list, spo2_list = [], []
+        for r in res.data:
+            dt = r.get("data_type", "")
+            v = r.get("value", "")
+            if dt == "heart_rate":
+                try: hr_list.append(int(v))
+                except: pass
+            elif dt == "blood_oxygen":
+                try: spo2_list.append(int(v))
+                except: pass
+
+        lines = [f"📊 【近{days}天健康数据报告】:"]
         for r in res.data:
             time_str = r.get("recorded_at", "")[:16]
             data_type = r.get("data_type", "")
@@ -55,15 +79,24 @@ async def get_health_data(days: int = 3) -> str:
             elif data_type == "sleep":
                 hours = round(float(value) / 3600, 1)
                 lines.append(f"  [{time_str}] 💤 睡眠: {hours}小时")
+            elif data_type == "resting_heart_rate":
+                lines.append(f"  [{time_str}] 💓 静息心率: {value}bpm")
+            elif data_type in ("heart_rate", "blood_oxygen"):
+                continue
             else:
                 lines.append(f"  [{time_str}] {data_type}: {value}")
+
+        if hr_list:
+            lines.append(f"  🫀 心率: 平均{sum(hr_list)//len(hr_list)}bpm | 最高{max(hr_list)}bpm | 最低{min(hr_list)}bpm (共{len(hr_list)}条)")
+        if spo2_list:
+            lines.append(f"  🩸 血氧: 平均{sum(spo2_list)//len(spo2_list)}% | 最高{max(spo2_list)}% | 最低{min(spo2_list)}% (共{len(spo2_list)}条)")
 
         return "\n".join(lines)
     except Exception as e:
         return f"❌ 查询健康数据失败: {e}"
 
 
-# ── SSE Transport + Starlette（与你能连上的那份完全一致）──
+# ── SSE Transport + Starlette ──────────────────────────────
 sse = SseServerTransport("/messages")
 
 async def handle_sse(request: Request):
